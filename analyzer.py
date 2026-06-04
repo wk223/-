@@ -1,101 +1,76 @@
-# 文件名：analyzer.py
-# 改造重点：parse()不再返回完整列表，直接流式写库，内存始终只占5万条
+from zoneinfo import available_timezones
 
-from config import FLUSH_SIZE
-from scapy.all import PcapReader, IP, TCP, UDP, ICMP, ARP, DNS
-from database import db
-import pandas as pd
+AGENT_SYSTEM_PROMPT = """
+你是一个旅行人工智能助手。你的功能是分析用户的请求并做出对应的规划设计
+#可用工具
+- 'get_weather(city: str)'查询指定城市的天气情况
+- 'get_attraction(city: str, weather: str)':根据城市和天气搜索推荐对应的旅游景点
+ 
+# 格式要求
+你的回复必须遵循以下格式，包含一对Thought和Action：
+Thought：[你的思考过程和下一步计划]
+Action：[你要执行的具体操作]
 
-# 每批写入数据库的包数量，平衡内存和写入频率
+#Action回复格式须是以下之一：
+1.调用工具：function_name(arg_name="arg_value")
+2.结束任务：Finish[最终答案]
+
+#重要提示：
+- 每次只输出一对Thought-Action
+- Action必须在同一行不要换行
+- 当收集到足够信息可以回答用户的问题的时候必须以Thought＋Action [最终答案]回复
+ 
+ 请开始
+
+"""
 
 
+import os
+from tavily import TavilyClient
+import requests
+def get_weather(city: str) -> str:
+    url = f"https://wttr.in/{city}?format=j1"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        
+        current_condition = data["current_condition"][0]
+        weather_desc = current_condition["weatherDesc"][0]['value']
+        temp_c = current_condition["temp_C"]
+        
+        return f"{city}当前天气：{weather_desc}，气温{temp_c}摄氏度"
+    
+    except requests.exceptions.RequestException as e:
+        return f"错误查询天气时遇到网络问题- {e}"
+    except (KeyError, IndexError) as e:
+        return  f"错误可能是城市名称不存在- {e}"
+    
+    
+def get_attraction(city: str, weather: str) -> str:
+    api_key = os.environ.get("API_KEY")
+    if not api_key:
+        return "错误：未配置TAVLILY_APIKEY环境变量"
+    tavily = TavilyClient(api_key=api_key)
+    query = f"'{city}'在'{weather}'天气下最值得去的旅游景点推荐及理由"
+    
+    try:
+        response = tavily.search(query=query, search_depth="basic", include_answers=Ture)
+        
+        if response.get("answer"):
+            answer = response["answer"]
+        formatted_result = []
+        for result in response.get("results",[]):
+            formatted_result.append(f"-{result['title']}: {result['content']}")
+            
+        if not formatted_result:
+            return f"抱歉没找到对应景点推荐"
+        return "根据搜索找到以下信息：\n"+"\n".join(formatted_result)
+    except Exception as e:
+        return f"错误"
+        
 
-class PcapAnalyzer:
-    def __init__(self, filepath: str):
-        self.filepath = filepath
-
-    def parse_and_save(self, task_id: str) -> int:
-        """
-        流式读取pcap，每FLUSH_SIZE条直接写库，不在内存积累。
-        返回总解析包数。
-        改造前：全部解析完再返回列表 → 百万包全在内存
-        改造后：边解析边写库 → 内存永远只有5万条
-        """
-        buffer = []
-        total = 0
-        engine = db.engine
-
-        with PcapReader(self.filepath) as reader:
-            for i, pkt in enumerate(reader):
-                rec = self._parse_one(pkt, i)
-                rec['task_id'] = task_id
-                buffer.append(rec)
-
-                # 攒够一批就写库，清空buffer
-                if len(buffer) >= FLUSH_SIZE:
-                    self._flush_to_db(buffer, engine)
-                    total += len(buffer)
-                    buffer = []
-                    print(f"[进度] task={task_id} 已写入 {total} 包")
-
-        # 写入最后一批剩余的
-        if buffer:
-            self._flush_to_db(buffer, engine)
-            total += len(buffer)
-
-        print(f"[完成] task={task_id} 共写入 {total} 包")
-        return total
-
-    def _flush_to_db(self, records: list, engine):
-        """批量写入数据库"""
-        if not records:
-            return
-
-        import pandas as pd
-        df = pd.DataFrame(records)
-
-        # 用pandas to_sql写入，兼容SQLAlchemy 2.x
-        df.to_sql(
-            'traffic',
-            engine,
-            if_exists='append',
-            index=False,
-            chunksize=5000
-        )
-
-    def _parse_one(self, pkt, i: int) -> dict:
-        """解析单个数据包，返回字典"""
-        rec = {
-            'index': i,
-            'timestamp': float(pkt.time),
-            'length': len(pkt),
-            'protocol': 'OTHER',
-            'src_ip': None, 'dst_ip': None,
-            'src_port': None, 'dst_port': None,
-            'flags': None, 'info': '',
-        }
-        if pkt.haslayer(IP):
-            rec['src_ip'] = pkt[IP].src
-            rec['dst_ip'] = pkt[IP].dst
-
-        if pkt.haslayer(TCP):
-            rec['protocol'] = 'TCP'
-            rec['src_port'] = pkt[TCP].sport
-            rec['dst_port'] = pkt[TCP].dport
-            rec['flags'] = str(pkt[TCP].flags)
-            rec['info'] = {80: 'HTTP', 443: 'HTTPS', 22: 'SSH',
-                           23: 'Telnet', 21: 'FTP'}.get(pkt[TCP].dport, '')
-        elif pkt.haslayer(UDP):
-            rec['protocol'] = 'UDP'
-            rec['src_port'] = pkt[UDP].sport
-            rec['dst_port'] = pkt[UDP].dport
-            if pkt.haslayer(DNS):
-                rec['info'] = 'DNS'
-        elif pkt.haslayer(ICMP):
-            rec['protocol'] = 'ICMP'
-        elif pkt.haslayer(ARP):
-            rec['protocol'] = 'ARP'
-            rec['src_ip'] = pkt[ARP].psrc
-            rec['dst_ip'] = pkt[ARP].pdst
-
-        return rec
+available_tools = {
+    "get_weather": get_weather,
+    "get_attraction": get_attraction,
+}
